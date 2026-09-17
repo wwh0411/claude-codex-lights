@@ -15,19 +15,25 @@ HEARTBEAT_FILE = BASE_DIR / "manager.heartbeat"
 SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
 BACKUP_PATH = BASE_DIR / "settings_backup.json"
 
-# Commands to inject into settings.json hooks
+# Commands to inject into settings.json hooks. Use the interpreter running the
+# setup/manager so self-healing never falls back to an unrelated system Python.
+# Deliberately unresolved: resolve() would follow the venv symlink to uv's
+# managed interpreter, which cannot import claude_eyes or AppKit.
+PYTHON_COMMAND = sys.executable
 REQUIRED_HOOKS: dict[str, list[str]] = {
     "SessionStart": [
-        "python -m claude_eyes.start",
-        "python -m claude_eyes.hook",
+        f"{PYTHON_COMMAND} -m claude_eyes.start",
+        f"{PYTHON_COMMAND} -m claude_eyes.hook",
     ],
-    "UserPromptSubmit": ["python -m claude_eyes.hook"],
-    "PermissionRequest": ["python -m claude_eyes.hook"],
-    "PreToolUse": ["python -m claude_eyes.hook"],
-    "PostToolUse": ["python -m claude_eyes.hook"],
-    "PostToolUseFailure": ["python -m claude_eyes.hook"],
-    "Stop": ["python -m claude_eyes.hook"],
-    "SessionEnd": ["python -m claude_eyes.hook"],
+    "SubagentStart": [f"{PYTHON_COMMAND} -m claude_eyes.hook"],
+    "SubagentStop": [f"{PYTHON_COMMAND} -m claude_eyes.hook"],
+    "UserPromptSubmit": [f"{PYTHON_COMMAND} -m claude_eyes.hook"],
+    "PermissionRequest": [f"{PYTHON_COMMAND} -m claude_eyes.hook"],
+    "PreToolUse": [f"{PYTHON_COMMAND} -m claude_eyes.hook"],
+    "PostToolUse": [f"{PYTHON_COMMAND} -m claude_eyes.hook"],
+    "PostToolUseFailure": [f"{PYTHON_COMMAND} -m claude_eyes.hook"],
+    "Stop": [f"{PYTHON_COMMAND} -m claude_eyes.hook"],
+    "SessionEnd": [f"{PYTHON_COMMAND} -m claude_eyes.hook"],
 }
 
 
@@ -36,7 +42,12 @@ def _is_ours(cmd: str) -> bool:
 
 
 def is_configured() -> bool:
-    """Check if all required claude-eyes hooks are in settings.json."""
+    """Check that every required hook runs the *current* interpreter.
+
+    Matching the exact command matters: a claude-codex-lights hook left pointing at
+    another interpreter (uv's managed python, a deleted venv) still looks
+    registered but cannot import claude_eyes, so it must be healed.
+    """
     if not SETTINGS_PATH.exists():
         return False
     try:
@@ -44,21 +55,26 @@ def is_configured() -> bool:
         hooks = config.get("hooks", {})
     except Exception:
         return False
+    if not isinstance(hooks, dict):
+        return False
     for event, cmds in REQUIRED_HOOKS.items():
         existing = hooks.get(event, [])
-        for cmd in cmds:
-            found = any(
-                _is_ours(h.get("command", ""))
-                for entry in existing
-                for h in entry.get("hooks", [])
-            )
-            if not found:
-                return False
+        if not isinstance(existing, list):
+            return False
+        registered = {
+            h.get("command", "")
+            for entry in existing
+            if isinstance(entry, dict)
+            for h in entry.get("hooks", [])
+            if isinstance(h, dict)
+        }
+        if not all(cmd in registered for cmd in cmds):
+            return False
     return True
 
 
 def configure_hooks() -> bool:
-    """Add claude-eyes hooks to settings.json. Returns True if changes made.
+    """Add claude-codex-lights hooks to settings.json. Returns True if changes made.
 
     Backs up the original config first. Idempotent — safe to call repeatedly.
     """
@@ -175,7 +191,7 @@ def acquire_startup_lock() -> bool:
 def main() -> None:
     # Self-healing: fix missing hooks on every SessionStart
     if configure_hooks():
-        print("claude-eyes: hooks registered in settings.json")
+        print("claude-codex-lights: hooks registered in settings.json")
 
     if _manager_alive():
         sys.exit(0)
@@ -195,9 +211,10 @@ def main() -> None:
             )
         else:
             subprocess.Popen(
-                ["python3", str(manager_py)],
+                [sys.executable, str(manager_py)],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                start_new_session=True,
             )
     except Exception:
         pass

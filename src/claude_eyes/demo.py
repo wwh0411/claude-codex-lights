@@ -11,19 +11,35 @@ import sys
 import uuid
 from datetime import datetime, timezone
 
-from claude_eyes.config import STATUS_DIR
+from claude_eyes.config import CONTEXT_LIMIT_DEFAULT, STATUS_DIR
 
-VALID_STATUSES = {"working", "waiting", "idle", "error"}
+VALID_STATUSES = {"working", "compacting", "waiting", "idle", "error"}
+
+# Context fill per demo state, chosen to walk the meter through all three of its
+# colours so one preview shows every band.
+DEMO_CONTEXT = {
+    "working": (82_000, 0, 3.4),
+    "compacting": (196_000, 1, 61.2),
+    "waiting": (150_000, 0, 18.9),
+    "idle": (188_000, 2, 244.0),
+    "error": (40_000, 0, 0.0),
+}
 
 
 def _write(sid: str, project: str, status: str, cwd: str = "") -> None:
     now = datetime.now(timezone.utc).isoformat()
+    context_tokens, compactions, cost = DEMO_CONTEXT.get(status, (0, 0, 0.0))
     payload = {
         "status": status,
         "session_id": sid,
         "tool_name": "",
         "last_event": "demo",
         "cwd": cwd or f"/home/{project}",
+        "context_tokens": context_tokens,
+        "context_limit": CONTEXT_LIMIT_DEFAULT,
+        "compact_count": compactions,
+        "compact_trigger": "auto" if compactions else "",
+        "cost_usd": cost,
         "prompt_time": now,
         "done_time": now,
         "timestamp": now,
@@ -50,10 +66,11 @@ def cmd_demo() -> None:
     cmd_clear()
     print("Creating demo entries...")
     _write("demo-working", "my-app", "working")
+    _write("demo-compacting", "long-session", "compacting")
     _write("demo-waiting", "deploy-script", "waiting")
     _write("demo-idle", "utils-lib", "idle")
     _write("demo-error", "broken-service", "error")
-    print("Done — panel should show 4 lights now.")
+    print("Done — panel should show 5 lights now.")
 
 
 def cmd_clear() -> None:

@@ -1,2 +1,2 @@
-"""Claude Traffic Light — floating status indicators for Claude Code sessions."""
-__version__ = "0.1.0"
+"""Claude Codex Lights — floating status indicators for Claude Code and Codex sessions."""
+__version__ = "0.2.0"

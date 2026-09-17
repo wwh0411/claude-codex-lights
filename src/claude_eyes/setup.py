@@ -1,4 +1,4 @@
-"""One-time hook setup: register claude-eyes hooks in settings.json.
+"""One-time hook setup: register claude-codex-lights hooks in settings.json.
 
 Usage:
     python -m claude_eyes.setup
@@ -11,9 +11,9 @@ from claude_eyes.start import configure_hooks, is_configured
 
 def main() -> None:
     if is_configured():
-        print("claude-eyes hooks are already configured.")
+        print("claude-codex-lights hooks are already configured.")
     elif configure_hooks():
-        print("claude-eyes hooks registered. Restart Claude Code to activate.")
+        print("claude-codex-lights hooks registered. Restart Claude Code to activate.")
     else:
         print("No settings.json found. Skipped hook registration.")
     sys.exit(0)

@@ -3,17 +3,25 @@ requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "claude-eyes"
-version = "0.1.0"
-description = "Floating traffic-light indicators for Claude Code sessions — real-time status dots (green/yellow/gray/red) showing what each Claude window is doing. 悬浮红绿灯指示灯，实时显示 Claude Code 会话状态。"
+name = "claude-codex-lights"
+version = "0.2.0"
+description = "Floating traffic-light panel for Claude Code and Codex CLI sessions — one dot per session showing what it is doing right now. 悬浮红绿灯面板，实时显示每个 Claude Code / Codex 会话的状态。"
 readme = "README.md"
 license = {text = "MIT"}
 authors = [
-    {name = "wzp0514", email = "623964346@qq.com"},
+    {name = "wwh0411"},
 ]
 requires-python = ">=3.9"
 dependencies = []
-keywords = ["claude-code", "status-indicator", "hooks", "tkinter", "floating-panel", "productivity"]
+keywords = [
+    "claude-code",
+    "codex",
+    "status-indicator",
+    "hooks",
+    "tkinter",
+    "floating-panel",
+    "productivity",
+]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -30,13 +38,13 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/wzp0514/claude-eyes"
-Repository = "https://github.com/wzp0514/claude-eyes"
-Issues = "https://github.com/wzp0514/claude-eyes/issues"
+Homepage = "https://github.com/wwh0411/claude-codex-lights"
+Repository = "https://github.com/wwh0411/claude-codex-lights"
+Issues = "https://github.com/wwh0411/claude-codex-lights/issues"
 
 [project.scripts]
-claude-eyes = "claude_eyes.manager:main"
-claude-eyes-setup = "claude_eyes.setup:main"
+claude-codex-lights = "claude_eyes.manager:main"
+claude-codex-lights-setup = "claude_eyes.setup:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

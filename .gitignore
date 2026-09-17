@@ -1,3 +1,11 @@
 __pycache__/
 build/
+dist/
 *.egg-info/
+.pytest_cache/
+.venv*/
+.DS_Store
+
+# 本地开发/交接产物，不进公开仓库
+.debug/
+HANDOFF.md
