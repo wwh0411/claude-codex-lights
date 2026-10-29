@@ -402,6 +402,25 @@ _TASK_ID_RE = re.compile(r"<task-id>(.*?)</task-id>", re.S)
 _TASK_STATUS_RE = re.compile(r"<status>(.*?)</status>", re.S)
 _TASK_SUMMARY_RE = re.compile(r"<summary>(.*?)</summary>", re.S)
 _EXIT_CODE_RE = re.compile(r"exit code (\d+)")
+# A monitor reports no backgroundTaskId, so its notification is matched on the
+# tool-use id it carries instead.
+_TOOL_USE_ID_RE = re.compile(r"<tool-use-id>(.*?)</tool-use-id>", re.S)
+_OUTPUT_PATH_RE = re.compile(r"Output is being written to: (\S+?\.output)")
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+# Tools that end a background task outright. A stopped task gets no
+# <task-notification>, so without reading these its light runs forever.
+_STOP_TOOLS = ("TaskStop", "KillShell", "KillBash")
+# A running task is checked against its output file — whether any process
+# still holds it, and what it last printed — at most this often.
+TASK_PROBE_INTERVAL = 15.0
+# How long after its ack a task must be before a missing holder retires it:
+# the harness opens the output file a moment after acknowledging.
+TASK_PROBE_GRACE = 30.0
+
+# The Monitor tool kills a watch at its own timeout_ms (30 minutes at most), so
+# a monitor past its deadline is gone whether or not a notice was ever written.
+MONITOR_DEFAULT_TIMEOUT_MS = 300_000.0
+MONITOR_MAX_TIMEOUT_MS = 1_800_000.0
 
 _BACKGROUND_STATE: dict[str, dict] = {}
 
@@ -463,11 +482,16 @@ def _absorb_notification(state: dict, content: object, timestamp: object = None)
     if not isinstance(content, str) or "<task-notification>" not in content:
         return
     task_id = _TASK_ID_RE.search(content)
-    if task_id is None:
-        return
-    task = state["tasks"].get(task_id.group(1).strip())
+    tool_use_id = _TOOL_USE_ID_RE.search(content)
+    task = None
+    if task_id is not None:
+        task = state["tasks"].get(task_id.group(1).strip())
+    if task is None and tool_use_id is not None:
+        # Monitors are keyed by tool-use id: the harness assigns them a task id
+        # only in the notification, long after the light has to exist.
+        task = state["tasks"].get(tool_use_id.group(1).strip())
     if task is None:
-        return  # subagents emit these too; only background commands are tracked
+        return  # subagents emit these too; only background work is tracked
     status = _TASK_STATUS_RE.search(content)
     summary = _TASK_SUMMARY_RE.search(content)
     reported = (status.group(1).strip() if status else "").lower()
@@ -483,6 +507,89 @@ def _absorb_notification(state: dict, content: object, timestamp: object = None)
     task["finished_at"] = _iso_epoch(timestamp) or time.time()
 
 
+def _command_summary(command: object) -> str:
+    """The command's first meaningful line, shown when it has no description."""
+    if not isinstance(command, str):
+        return ""
+    for line in command.splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            return " ".join(stripped.split())[:120]
+    return ""
+
+
+def _tool_result_text(block: dict) -> str:
+    content = block.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            part.get("text", "") for part in content if isinstance(part, dict)
+        )
+    return ""
+
+
+def _absorb_stop(state: dict, payload: dict, timestamp: object) -> None:
+    """A TaskStop/KillShell call ends the background task or monitor it names."""
+    target = payload.get("task_id") or payload.get("shell_id")
+    if not isinstance(target, str) or not target:
+        return
+    task = state["tasks"].get(target)
+    if task is None:
+        # Monitors are keyed by tool-use id, but are stopped by task id.
+        task = next(
+            (t for t in state["tasks"].values() if t.get("task_id") == target), None
+        )
+    if task is None or task["status"] != "working":
+        return
+    task["status"] = "stale"
+    task["finished_at"] = _iso_epoch(timestamp) or time.time()
+
+
+def _register_monitor(state: dict, block: dict, timestamp: object) -> None:
+    """Track a Monitor call as a running light, keyed by its tool-use id.
+
+    A monitor differs from `Bash(run_in_background=True)` in the two places
+    that matter here: it never reports a `backgroundTaskId`, and its only
+    completion notice is a <task-notification> carrying the tool-use id. So the
+    tool-use id is claimed at call time — waiting for a notification instead
+    would mean a monitor is first drawn at the moment it stops existing.
+
+    Re-arming is the normal life of a monitor (it expires after minutes and is
+    started again), so a finished monitor watching the same thing is dropped
+    rather than left to sit out its done-timeout beside its own replacement.
+    """
+    tool_use_id = block.get("id")
+    if not isinstance(tool_use_id, str) or not tool_use_id:
+        return
+    payload = block.get("input") or {}
+    name = _task_label(payload.get("description"), payload.get("command")) or "monitor"
+    for key, task in list(state["tasks"].items()):
+        if (
+            task.get("kind") == "monitor"
+            and task.get("name") == name
+            and task.get("status") != "working"
+        ):
+            del state["tasks"][key]
+    try:
+        timeout_ms = float(payload.get("timeout_ms") or MONITOR_DEFAULT_TIMEOUT_MS)
+    except (TypeError, ValueError):
+        timeout_ms = MONITOR_DEFAULT_TIMEOUT_MS
+    timeout_ms = min(max(timeout_ms, 0.0), MONITOR_MAX_TIMEOUT_MS)
+    state["tasks"][tool_use_id] = {
+        "agent_id": f"monitor:{tool_use_id}",
+        "kind": "monitor",
+        "timeout_ms": timeout_ms,
+        "name": name,
+        "agent_type": "monitor",
+        "model": "",
+        "status": "working",
+        "timestamp": timestamp if isinstance(timestamp, str) else "",
+        "started_at": _iso_epoch(timestamp),
+        "finished_at": 0.0,
+    }
+
+
 def _absorb_transcript_item(state: dict, item: dict) -> None:
     kind = item.get("type")
     if kind == "assistant":
@@ -490,12 +597,24 @@ def _absorb_transcript_item(state: dict, item: dict) -> None:
             if not isinstance(block, dict) or block.get("type") != "tool_use":
                 continue
             payload = block.get("input")
-            if block.get("name") != "Bash" or not isinstance(payload, dict):
+            if not isinstance(payload, dict):
                 continue
-            if not payload.get("run_in_background"):
+            if block.get("name") == "Monitor":
+                _register_monitor(state, block, item.get("timestamp"))
                 continue
+            if block.get("name") in _STOP_TOOLS:
+                _absorb_stop(state, payload, item.get("timestamp"))
+                continue
+            if block.get("name") != "Bash":
+                continue
+            # Every Bash call is remembered, not only run_in_background ones: a
+            # foreground command that outlives its timeout is moved to the
+            # background by the harness, and its ack is the first sign of it.
+            # Without the call's description that task could only be shown by
+            # its opaque id. Entries are dropped again when the result arrives.
             state["pending"][block.get("id")] = {
                 "name": _task_label(payload.get("description"), payload.get("command")),
+                "command": _command_summary(payload.get("command")),
                 "started_at": _iso_epoch(item.get("timestamp")),
             }
     elif kind == "user":
@@ -507,23 +626,33 @@ def _absorb_transcript_item(state: dict, item: dict) -> None:
         _absorb_notification(state, _user_message_text(item), item.get("timestamp"))
         result = item.get("toolUseResult")
         task_id = result.get("backgroundTaskId") if isinstance(result, dict) else None
-        if not isinstance(task_id, str) or not task_id:
-            return
         for block in _content_blocks(item):
-            if isinstance(block, dict) and block.get("type") == "tool_result":
-                started = state["pending"].pop(block.get("tool_use_id"), {})
-                state["tasks"][task_id] = {
-                    "agent_id": f"task:{task_id}",
-                    "kind": "task",
-                    "name": started.get("name") or f"后台任务 {task_id}",
-                    "agent_type": "background",
-                    "model": "",
-                    "status": "working",
-                    "timestamp": item.get("timestamp", ""),
-                    "started_at": started.get("started_at") or _iso_epoch(item.get("timestamp")),
-                    "finished_at": 0.0,
-                }
-                break
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            monitor = state["tasks"].get(block.get("tool_use_id"))
+            if monitor is not None and monitor.get("kind") == "monitor":
+                # "Monitor started (task <id>, ...)": the id TaskStop will use.
+                if isinstance(result, dict) and isinstance(result.get("taskId"), str):
+                    monitor["task_id"] = result["taskId"]
+                continue
+            started = state["pending"].pop(block.get("tool_use_id"), {})
+            if not isinstance(task_id, str) or not task_id:
+                continue  # an ordinary command that finished in the foreground
+            output = _OUTPUT_PATH_RE.search(_tool_result_text(block))
+            state["tasks"][task_id] = {
+                "agent_id": f"task:{task_id}",
+                "kind": "task",
+                "name": started.get("name") or f"后台任务 {task_id}",
+                "command": started.get("command", ""),
+                "output_path": output.group(1) if output else "",
+                "agent_type": "background",
+                "model": "",
+                "status": "working",
+                "timestamp": item.get("timestamp", ""),
+                "started_at": started.get("started_at") or _iso_epoch(item.get("timestamp")),
+                "finished_at": 0.0,
+            }
+            break
     elif kind == "attachment":
         attachment = item.get("attachment")
         if isinstance(attachment, dict) and attachment.get("commandMode") == "task-notification":
@@ -611,6 +740,106 @@ def _session_superseded(session_id: str) -> bool:
     return verdict
 
 
+def _output_holders(paths: list[str]) -> set[str] | None:
+    """Which of these files some process still has open, or None if unknown.
+
+    The harness hands a background command its output file as stdout, so the
+    file stays open exactly as long as the command lives. One lsof call covers
+    every path; a failure to run it returns None, which means "do not judge",
+    never "all dead".
+    """
+    if not paths:
+        return set()
+    try:
+        out = subprocess.run(
+            ["lsof", "-F", "n", "--", *paths],
+            capture_output=True, text=True, timeout=3,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    wanted = set(paths)
+    held = set()
+    for line in out.splitlines():
+        if not line.startswith("n"):
+            continue
+        name = line[1:]
+        # lsof reports /private/tmp paths resolved; the transcript may not.
+        for path in wanted:
+            if name == path or name.endswith(path.removeprefix("/private")):
+                held.add(path)
+    return held
+
+
+def _last_output_line(path: str) -> str:
+    """What a running command printed last — the closest thing to "doing what"."""
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(0, 2)
+            size = handle.tell()
+            handle.seek(max(0, size - 4096))
+            tail = handle.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+    for line in reversed(tail.splitlines()):
+        # Progress bars rewrite one line with \r; only the latest frame counts.
+        text = _ANSI_RE.sub("", line.rsplit("\r", 1)[-1]).strip()
+        if text:
+            return " ".join(text.split())[:120]
+    return ""
+
+
+def _probe_tasks(tasks, now_ts: float) -> None:
+    """Retire background commands that died silently, and refresh their output.
+
+    A command ends without any notice when it is killed from outside, when the
+    session that owned it exits, or when the harness simply does not write one;
+    reading only notifications pinned such a light to "running" for weeks.
+    """
+    due = [
+        task for task in tasks
+        if task.get("kind") == "task"
+        and task["status"] == "working"
+        and task.get("output_path")
+        and now_ts - task.get("probed_at", 0.0) >= TASK_PROBE_INTERVAL
+    ]
+    if not due:
+        return
+    existing = [t["output_path"] for t in due if os.path.exists(t["output_path"])]
+    held = _output_holders(existing)
+    for task in due:
+        task["probed_at"] = now_ts
+        path = task["output_path"]
+        if now_ts - (task.get("started_at") or now_ts) < TASK_PROBE_GRACE:
+            continue
+        if not os.path.exists(path):
+            # The temp directory was cleaned (reboot, harness cleanup).
+            task["status"] = "stale"
+            task["finished_at"] = task.get("started_at") or now_ts
+            continue
+        task["detail"] = _last_output_line(path)
+        if held is not None and path not in held:
+            task["status"] = "stale"
+            try:
+                # The file's last write is when the command last did anything,
+                # so a manager restart does not show weeks-old tasks as fresh.
+                task["finished_at"] = os.path.getmtime(path)
+            except OSError:
+                task["finished_at"] = now_ts
+
+
+def _monitor_deadline(task: dict) -> float | None:
+    """When a monitor is guaranteed to be dead, or None for anything else."""
+    if task.get("kind") != "monitor":
+        return None
+    started = task.get("started_at") or 0.0
+    if not started:
+        return None
+    timeout_ms = task.get("timeout_ms") or MONITOR_DEFAULT_TIMEOUT_MS
+    # A little slack: the runtime kills the watch at the deadline, and the
+    # notification that confirms it lands a moment later.
+    return started + timeout_ms / 1000.0 + 30.0
+
+
 def _background_tasks(session_id: str, now: datetime) -> list[dict]:
     transcript = _session_transcript(session_id)
     if transcript is None:
@@ -641,11 +870,19 @@ def _background_tasks(session_id: str, now: datetime) -> list[dict]:
                 _absorb_transcript_item(state, item)
 
     visible = []
+    now_ts = time.time()
+    _probe_tasks(state["tasks"].values(), now_ts)
     for task in state["tasks"].values():
         if task["status"] == "working":
-            visible.append(dict(task, age_seconds=0.0))
-            continue
-        age = max(0.0, time.time() - task["finished_at"])
+            deadline = _monitor_deadline(task)
+            if deadline is None or now_ts <= deadline:
+                visible.append(dict(task, age_seconds=0.0))
+                continue
+            # Expired: the harness writes a notification for some monitors and
+            # not others, so the tool's own guarantee is what retires the light.
+            task["status"] = "idle"
+            task["finished_at"] = deadline
+        age = max(0.0, now_ts - task["finished_at"])
         if age <= SUBAGENT_DONE_TIMEOUT:
             visible.append(dict(task, age_seconds=age))
     return visible
@@ -677,7 +914,6 @@ def _discover_subagents(
             # The live session's own copy of an agent wins over an ancestor's.
             if summary and summary["agent_id"] not in discovered:
                 discovered[summary["agent_id"]] = summary
-
 
     # Hook events carry precise waiting/error/stop states; overlay them when
     # available, while transcript discovery covers agents already running.

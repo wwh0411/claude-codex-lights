@@ -1,3 +1,4 @@
+import time
 """Tests for panel rendering decisions that do not depend on live sessions."""
 import tkinter as tk
 
@@ -1108,3 +1109,45 @@ def test_interleaving_survives_repacks(live_panel):
     for i, tag in enumerate(order):
         if tag[0] == "header":
             assert order[i + 1][0] == "row"
+
+
+@pytest.fixture()
+def sub_light():
+    try:
+        root = tk.Tk()
+    except tk.TclError:  # no display available
+        pytest.skip("Tk display unavailable")
+    root.withdraw()
+    frame = tk.Frame(root)
+    yield panel_module._SubLight(frame, "medium")
+    root.destroy()
+
+
+def test_a_running_task_shows_what_it_last_printed_and_for_how_long(sub_light):
+    sub_light.update({
+        "kind": "task", "status": "working", "name": "Wait for the build",
+        "detail": "test 7/10", "started_at": time.time() - 125,
+    })
+
+    assert sub_light._lbl_detail.cget("text") == "test 7/10"
+    assert sub_light._lbl_detail.winfo_manager() == "pack"
+    assert sub_light._lbl_state.cget("text") == "运行中 2m"
+
+
+def test_a_task_with_no_output_yet_shows_its_command(sub_light):
+    sub_light.update({
+        "kind": "task", "status": "working", "name": "Open the tunnel",
+        "command": "ssh -N devbox", "started_at": time.time() - 5,
+    })
+
+    assert sub_light._lbl_detail.cget("text") == "$ ssh -N devbox"
+
+
+def test_a_finished_task_drops_its_detail_line(sub_light):
+    sub_light.update({"kind": "task", "status": "working", "name": "job",
+                      "detail": "halfway", "started_at": time.time()})
+    sub_light.update({"kind": "task", "status": "stale", "name": "job",
+                      "detail": "halfway", "started_at": time.time()})
+
+    assert sub_light._lbl_detail.winfo_manager() == ""
+    assert sub_light._lbl_state.cget("text") == "已终止"

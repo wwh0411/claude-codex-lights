@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-codex-lights"
-version = "0.2.0"
+version = "0.3.0"
 description = "Floating traffic-light panel for Claude Code and Codex CLI sessions — one dot per session showing what it is doing right now. 悬浮红绿灯面板，实时显示每个 Claude Code / Codex 会话的状态。"
 readme = "README.md"
 license = {text = "MIT"}

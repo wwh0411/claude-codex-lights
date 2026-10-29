@@ -986,6 +986,94 @@ def test_scan_drops_a_superseded_parent_and_deletes_its_file(monkeypatch, tmp_pa
 
 
 # ----------------------------------------------------------------------
+# monitors (Monitor tool)
+# ----------------------------------------------------------------------
+def _monitor_start(tool_use_id, description, timeout_ms=300_000, ts=None):
+    if ts is None:
+        ts = datetime.now(timezone.utc).isoformat()
+    return json.dumps({
+        "type": "assistant", "timestamp": ts,
+        "message": {"content": [{
+            "type": "tool_use", "id": tool_use_id, "name": "Monitor",
+            "input": {"command": "tail -f app.log | grep ERROR",
+                      "description": description, "timeout_ms": timeout_ms},
+        }]},
+    })
+
+
+def _monitor_notify(tool_use_id, status="killed", ts=None):
+    """A monitor notice names the tool-use id; it carries no backgroundTaskId."""
+    if ts is None:
+        ts = datetime.now(timezone.utc).isoformat()
+    return json.dumps({
+        "type": "attachment", "timestamp": ts,
+        "attachment": {
+            "type": "queued_command", "commandMode": "task-notification",
+            "prompt": (f"<task-notification>\n<task-id>bg-unknown-{tool_use_id}</task-id>\n"
+                       f"<tool-use-id>{tool_use_id}</tool-use-id>\n"
+                       f"<status>{status}</status>\n<summary>Monitor stopped</summary>\n"
+                       "</task-notification>"),
+        },
+    })
+
+
+def test_a_running_monitor_gets_its_own_light(monkeypatch, tmp_path):
+    _write_transcript(tmp_path, monkeypatch, "sid-mon", [
+        _monitor_start("toolu_m1", "deploy errors"),
+    ])
+    tasks = manager._background_tasks("sid-mon", _now())
+
+    assert [(t["kind"], t["name"], t["status"]) for t in tasks] == [
+        ("monitor", "deploy errors", "working")
+    ]
+
+
+def test_a_monitor_past_its_timeout_stops_being_working(monkeypatch, tmp_path):
+    """No notice is written for every expiry, so the tool's own deadline retires it."""
+    started = datetime.now(timezone.utc) - timedelta(minutes=12)
+    _write_transcript(tmp_path, monkeypatch, "sid-mon-old", [
+        _monitor_start("toolu_m1", "long gone", timeout_ms=300_000,
+                       ts=started.isoformat()),
+    ])
+    tasks = manager._background_tasks("sid-mon-old", _now())
+
+    # Expired at minute 5, hidden by the done-timeout at minute 15: still listed
+    # here, but no longer claiming to be running.
+    assert [t["status"] for t in tasks] == ["idle"]
+
+
+def test_an_expired_monitor_disappears_after_the_done_timeout(monkeypatch, tmp_path):
+    started = datetime.now(timezone.utc) - timedelta(minutes=40)
+    _write_transcript(tmp_path, monkeypatch, "sid-mon-gone", [
+        _monitor_start("toolu_m1", "ancient", timeout_ms=300_000,
+                       ts=started.isoformat()),
+    ])
+    assert manager._background_tasks("sid-mon-gone", _now()) == []
+
+
+def test_a_monitor_notice_is_matched_on_its_tool_use_id(monkeypatch, tmp_path):
+    _write_transcript(tmp_path, monkeypatch, "sid-mon-kill", [
+        _monitor_start("toolu_m1", "watch the queue"),
+        _monitor_notify("toolu_m1", "killed"),
+    ])
+    tasks = manager._background_tasks("sid-mon-kill", _now())
+
+    assert [(t["name"], t["status"]) for t in tasks] == [("watch the queue", "stale")]
+
+
+def test_re_arming_a_monitor_replaces_the_finished_one(monkeypatch, tmp_path):
+    """A monitor expires and is started again — that is one watch, not two lights."""
+    _write_transcript(tmp_path, monkeypatch, "sid-mon-rearm", [
+        _monitor_start("toolu_m1", "same watch"),
+        _monitor_notify("toolu_m1", "completed"),
+        _monitor_start("toolu_m2", "same watch"),
+    ])
+    tasks = manager._background_tasks("sid-mon-rearm", _now())
+
+    assert [(t["name"], t["status"]) for t in tasks] == [("same watch", "working")]
+
+
+# ----------------------------------------------------------------------
 # forked sessions
 # ----------------------------------------------------------------------
 def test_a_forked_session_finds_the_subagents_of_the_id_it_forked_from(
@@ -1017,3 +1105,141 @@ def test_a_plain_session_reports_no_fork_parent(monkeypatch, tmp_path):
     _write_transcript(tmp_path, monkeypatch, "sid-plain", [_user("hello")])
 
     assert manager._fork_chain("sid-plain") == ["sid-plain"]
+
+
+# ----------------------------------------------------------------------
+# background commands that end without a notice, and what they are doing
+# ----------------------------------------------------------------------
+def _bg_timeout_start(tool_use_id, description, command="make test"):
+    """A foreground Bash call — no run_in_background — that will outlive its timeout."""
+    return json.dumps({
+        "type": "assistant", "timestamp": datetime.now(timezone.utc).isoformat(),
+        "message": {"content": [{
+            "type": "tool_use", "id": tool_use_id, "name": "Bash",
+            "input": {"command": command, "description": description},
+        }]},
+    })
+
+
+def _bg_timeout_ack(tool_use_id, task_id, output_path):
+    return json.dumps({
+        "type": "user", "timestamp": datetime.now(timezone.utc).isoformat(),
+        "message": {"content": [{
+            "type": "tool_result", "tool_use_id": tool_use_id,
+            "content": (f"Command did not complete within its 120s timeout and was "
+                        f"moved to the background (ID: {task_id}). Output is being "
+                        f"written to: {output_path}. You will be notified."),
+        }]},
+        "toolUseResult": {"backgroundTaskId": task_id, "timedOutAfterMs": 120000},
+    })
+
+
+def _stop(task_id, tool="TaskStop"):
+    key = "shell_id" if tool == "KillShell" else "task_id"
+    return json.dumps({
+        "type": "assistant", "timestamp": datetime.now(timezone.utc).isoformat(),
+        "message": {"content": [{
+            "type": "tool_use", "id": f"toolu_stop_{task_id}", "name": tool,
+            "input": {key: task_id},
+        }]},
+    })
+
+
+def test_a_command_moved_to_the_background_keeps_its_description(monkeypatch, tmp_path):
+    _write_transcript(tmp_path, monkeypatch, "sid-auto", [
+        _bg_timeout_start("toolu_1", "Wait for the build"),
+        _bg_timeout_ack("toolu_1", "bauto1", str(tmp_path / "bauto1.output")),
+    ])
+    tasks = manager._background_tasks("sid-auto", _now())
+
+    assert [(t["name"], t["status"]) for t in tasks] == [("Wait for the build", "working")]
+    assert tasks[0]["output_path"] == str(tmp_path / "bauto1.output")
+
+
+def test_a_foreground_command_leaves_nothing_pending(monkeypatch, tmp_path):
+    """Remembering every Bash call must not grow without bound."""
+    _write_transcript(tmp_path, monkeypatch, "sid-fg", [
+        _bg_timeout_start("toolu_1", "ls"),
+        json.dumps({"type": "user", "timestamp": "2026-08-24T13:00:01.000Z",
+                    "message": {"content": [{"type": "tool_result",
+                                             "tool_use_id": "toolu_1", "content": "ok"}]},
+                    "toolUseResult": {"stdout": "ok"}}),
+    ])
+    manager._background_tasks("sid-fg", _now())
+
+    assert manager._BACKGROUND_STATE["sid-fg"]["pending"] == {}
+
+
+@pytest.mark.parametrize("tool", ["TaskStop", "KillShell"])
+def test_a_stopped_task_stops_running(monkeypatch, tmp_path, tool):
+    _write_transcript(tmp_path, monkeypatch, "sid-stop", [
+        _bg_start("toolu_1", "Tail the logs"), _bg_ack("toolu_1", "bstop1"),
+        _stop("bstop1", tool),
+    ])
+    tasks = manager._background_tasks("sid-stop", _now())
+
+    assert [t["status"] for t in tasks] == ["stale"]
+
+
+def test_a_monitor_stopped_by_its_task_id_stops_running(monkeypatch, tmp_path):
+    _write_transcript(tmp_path, monkeypatch, "sid-mon-stop", [
+        _monitor_start("toolu_m1", "watch errors"),
+        json.dumps({"type": "user", "timestamp": _now().isoformat(),
+                    "message": {"content": [{"type": "tool_result",
+                                             "tool_use_id": "toolu_m1",
+                                             "content": "Monitor started (task bmon1)"}]},
+                    "toolUseResult": {"taskId": "bmon1", "timeoutMs": 300000}}),
+        _stop("bmon1"),
+    ])
+    tasks = manager._background_tasks("sid-mon-stop", _now())
+
+    assert [(t["kind"], t["status"]) for t in tasks] == [("monitor", "stale")]
+
+
+def _aged_task(monkeypatch, tmp_path, sid, output, holders):
+    """A running task old enough to be probed, with lsof faked."""
+    _write_transcript(tmp_path, monkeypatch, sid, [
+        _bg_timeout_start("toolu_1", "Long job"),
+        _bg_timeout_ack("toolu_1", "bprobe", str(output)),
+    ])
+    monkeypatch.setattr(manager, "_output_holders", lambda paths: holders(paths))
+    manager._background_tasks(sid, _now())   # parse the transcript
+    task = manager._BACKGROUND_STATE[sid]["tasks"]["bprobe"]
+    task["started_at"] = time.time() - 600
+    task["probed_at"] = 0.0
+    return manager._background_tasks(sid, _now())
+
+
+def test_a_task_whose_output_nobody_holds_is_retired(monkeypatch, tmp_path):
+    output = tmp_path / "bprobe.output"
+    output.write_text("step 1\nstep 2\n")
+    stamp = time.time() - 60
+    os.utime(output, (stamp, stamp))
+    tasks = _aged_task(monkeypatch, tmp_path, "sid-dead", output, lambda paths: set())
+
+    assert [t["status"] for t in tasks] == ["stale"]
+    # Finished when it last wrote, not when the probe noticed.
+    assert abs(tasks[0]["age_seconds"] - 60) < 5
+
+
+def test_a_held_task_stays_running_and_shows_its_last_line(monkeypatch, tmp_path):
+    output = tmp_path / "bprobe.output"
+    output.write_text("compiling\n\x1b[32mtest 3/10\x1b[0m\rtest 7/10\n\n")
+    tasks = _aged_task(monkeypatch, tmp_path, "sid-live", output, lambda paths: set(paths))
+
+    assert [(t["status"], t["detail"]) for t in tasks] == [("working", "test 7/10")]
+
+
+def test_a_task_whose_output_file_vanished_is_retired(monkeypatch, tmp_path):
+    tasks = _aged_task(monkeypatch, tmp_path, "sid-gone", tmp_path / "missing.output",
+                       lambda paths: set(paths))
+
+    assert tasks == []   # retired long ago, so already past the done-timeout
+
+
+def test_lsof_failure_never_retires_a_task(monkeypatch, tmp_path):
+    output = tmp_path / "bprobe.output"
+    output.write_text("still going\n")
+    tasks = _aged_task(monkeypatch, tmp_path, "sid-unknown", output, lambda paths: None)
+
+    assert [t["status"] for t in tasks] == ["working"]

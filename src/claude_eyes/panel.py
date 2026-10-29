@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import math
 import sys
+import time
 import tkinter as tk
 from collections import OrderedDict
 from datetime import datetime, timezone
@@ -78,6 +79,15 @@ TASK_STATUS_LABEL: dict[str, str] = {
     "error": "失败",
 }
 
+# A monitor watches until it expires or is stopped; it never "exits" with a
+# code the way a background command does.
+MONITOR_STATUS_LABEL: dict[str, str] = {
+    "working": "监控中",
+    "idle": "已结束",
+    "stale": "已停止",
+    "error": "失败",
+}
+
 PANEL_BG = "#111318"
 ROW_BG = "#17191f"
 TITLE_FG = "#f1f2f4"
@@ -110,6 +120,7 @@ HANDLE_BG = "#1b1d23"
 GROUP_FG = "#dbdfe6"
 SUB_NAME_FG = "#9aa0ac"
 SUB_META_FG = "#666b76"
+SUB_DETAIL_FG = "#565b66"
 
 
 class _CompletionPopup:
@@ -1260,19 +1271,27 @@ class _SubLight:
         self._kind = "agent"
 
         self.frame = tk.Frame(parent, bg=ROW_BG)
+        row = tk.Frame(self.frame, bg=ROW_BG)
+        row.pack(fill=tk.X)
         self._canvas = tk.Canvas(
-            self.frame, bg=ROW_BG, highlightthickness=0, bd=0,
+            row, bg=ROW_BG, highlightthickness=0, bd=0,
         )
         self._dot = self._canvas.create_oval(0, 0, 0, 0, fill="", outline="")
         self._canvas.pack(side=tk.LEFT)
         self._lbl_name = tk.Label(
-            self.frame, text="", fg=SUB_NAME_FG, bg=ROW_BG, anchor="w",
+            row, text="", fg=SUB_NAME_FG, bg=ROW_BG, anchor="w",
         )
         self._lbl_name.pack(side=tk.LEFT, padx=(5, 0))
         self._lbl_state = tk.Label(
-            self.frame, text="", fg=SUB_META_FG, bg=ROW_BG, anchor="e",
+            row, text="", fg=SUB_META_FG, bg=ROW_BG, anchor="e",
         )
         self._lbl_state.pack(side=tk.RIGHT)
+        # What a running background command last printed. A label alone ("Wait
+        # for build") says what it was started for, not what it is doing now.
+        self._lbl_detail = tk.Label(
+            self.frame, text="", fg=SUB_DETAIL_FG, bg=ROW_BG, anchor="w",
+        )
+        self._detail_shown = False
         self.set_size(size)
 
     # ------------------------------------------------------------------
@@ -1292,13 +1311,26 @@ class _SubLight:
         name = _one_line(info.get("name", "")) or "subagent"
         self._lbl_name.configure(text=_truncate(name, chars))
 
-        if kind == "task":
+        detail = ""
+        if kind == "task" and status == "working":
+            detail = _one_line(info.get("detail", ""))
+            if not detail and info.get("command") and info.get("command") != info.get("name"):
+                detail = "$ " + _one_line(info["command"])
+        self._set_detail(_truncate(detail, chars + 6) if detail else "")
+
+        if kind == "monitor":
+            state = MONITOR_STATUS_LABEL.get(status, status)
+        elif kind == "task":
             state = TASK_STATUS_LABEL.get(status, status)
             exit_code = info.get("exit_code")
             if status == "error" and isinstance(exit_code, int):
                 state = f"退出码 {exit_code}"
         else:
             state = STATUS_LABEL.get(status, status)
+        if kind in ("task", "monitor") and status == "working":
+            elapsed = _elapsed_label(info.get("started_at"))
+            if elapsed:
+                state = f"{state} {elapsed}"
         hidden = info.get("hidden_count")
         if hidden:
             state = f"{state} · 另 {hidden} 个"
@@ -1306,7 +1338,10 @@ class _SubLight:
             text=state,
             fg="#69a8ff" if status == "working" else _rgb_hex(rgb),
         )
-        self._canvas.itemconfig(self._dot, fill=_rgb_hex(rgb))
+        if kind == "monitor":
+            self._canvas.itemconfig(self._dot, outline=_rgb_hex(rgb))
+        else:
+            self._canvas.itemconfig(self._dot, fill=_rgb_hex(rgb))
 
     def set_size(self, size: str) -> None:
         self._size = size if size in PANEL_SIZES else "medium"
@@ -1315,16 +1350,40 @@ class _SubLight:
         self._draw_marker()
         self._lbl_name.configure(font=("Helvetica Neue", cfg["sub_font"]))
         self._lbl_state.configure(font=("Helvetica Neue", cfg["sub_font"]))
+        self._lbl_detail.configure(font=("Menlo", max(7, cfg["sub_font"] - 1)))
+        if self._detail_shown:
+            # Indent under the label, past the marker.
+            self._lbl_detail.pack_configure(padx=(cfg["sub_dot"] + 7, 0))
+
+    def _set_detail(self, text: str) -> None:
+        if text:
+            self._lbl_detail.configure(text=text)
+            if not self._detail_shown:
+                indent = PANEL_SIZES[self._size]["sub_dot"] + 7
+                self._lbl_detail.pack(fill=tk.X, padx=(indent, 0))
+                self._detail_shown = True
+        elif self._detail_shown:
+            self._lbl_detail.pack_forget()
+            self._detail_shown = False
 
     def _draw_marker(self) -> None:
-        """Round marker for a subagent, square for a background command."""
+        """Round for a subagent, filled square for a command, hollow for a monitor.
+
+        A monitor is drawn hollow because it is the one sub-light that means
+        "watching" rather than "doing": it burns nothing, and it keeps
+        re-arming, so it should not read as loudly as a live agent.
+        """
         dot = PANEL_SIZES[self._size]["sub_dot"]
         self._canvas.delete(self._dot)
-        draw = self._canvas.create_rectangle if self._kind == "task" else self._canvas.create_oval
+        square = self._kind in ("task", "monitor")
+        draw = self._canvas.create_rectangle if square else self._canvas.create_oval
         inset = 1 if self._kind == "agent" else 2
+        colour = _rgb_hex(self._color_rgb)
         self._dot = draw(
             inset, inset, dot + 2 - inset, dot + 2 - inset,
-            fill=_rgb_hex(self._color_rgb), outline="",
+            fill="" if self._kind == "monitor" else colour,
+            outline=colour if self._kind == "monitor" else "",
+            width=2 if self._kind == "monitor" else 1,
         )
 
     def apply_blink(self, on: bool) -> None:
@@ -1335,7 +1394,10 @@ class _SubLight:
         # pulse between full and dimmed so the hue always reads.
         factor = 0.45 if self._status == "working" else 0.3
         rgb = self._color_rgb if on else _dim(self._color_rgb, factor)
-        self._canvas.itemconfig(self._dot, fill=_rgb_hex(rgb))
+        if self._kind == "monitor":
+            self._canvas.itemconfig(self._dot, outline=_rgb_hex(rgb))
+        else:
+            self._canvas.itemconfig(self._dot, fill=_rgb_hex(rgb))
 
 
 # ======================================================================
@@ -1460,7 +1522,7 @@ class _Entry:
         self._strip = tk.Canvas(
             self._inner, bg=ROW_BG, highlightthickness=0, bd=0, width=1, height=1,
         )
-        self._strip_dots: list[tuple[int, str]] = []
+        self._strip_dots: list[tuple[int, str, str]] = []
 
         self.set_size(size)
         self.update(data)
@@ -1559,6 +1621,8 @@ class _Entry:
                 info.get("name", ""),
                 info.get("exit_code"),
                 info.get("hidden_count") or 0,
+                info.get("detail", ""),
+                _elapsed_label(info.get("started_at")) if info.get("status") == "working" else "",
             )
             for info in infos
         )
@@ -1601,17 +1665,19 @@ class _Entry:
         for index, info in enumerate(self._sub_infos):
             status = info.get("status", "working")
             left = index * step
+            kind = info.get("kind")
             draw = (
                 self._strip.create_rectangle
-                if info.get("kind") == "task"
+                if kind in ("task", "monitor")
                 else self._strip.create_oval
             )
+            colour = _rgb_hex(COLOR_MAP.get(status, GRAY))
             item = draw(
                 left, 0, left + size, size,
-                fill=_rgb_hex(COLOR_MAP.get(status, GRAY)),
-                outline="",
+                fill="" if kind == "monitor" else colour,
+                outline=colour if kind == "monitor" else "",
             )
-            self._strip_dots.append((item, status))
+            self._strip_dots.append((item, status, kind or "agent"))
         width = len(self._sub_infos) * step - 3
         hidden = self._sub_infos[-1].get("hidden_count") if self._sub_infos else 0
         if hidden:
@@ -1680,14 +1746,17 @@ class _Entry:
         for index, light in enumerate(self._sub_lights):
             if index < len(self._sub_infos):
                 light.apply_blink(on)
-        for item, status in self._strip_dots:
+        for item, status, kind in self._strip_dots:
             if status not in ("working", "waiting", "error"):
                 continue
             rgb = COLOR_MAP.get(status, GRAY)
             factor = 0.45 if status == "working" else 0.3
-            self._strip.itemconfig(
-                item, fill=_rgb_hex(rgb if on else _dim(rgb, factor)),
-            )
+            shade = _rgb_hex(rgb if on else _dim(rgb, factor))
+            # A monitor is drawn hollow, so pulsing its fill would fill it in.
+            if kind == "monitor":
+                self._strip.itemconfig(item, outline=shade)
+            else:
+                self._strip.itemconfig(item, fill=shade)
 
     def show_details(self) -> None:
         self._detail_mode = True
@@ -1873,6 +1942,19 @@ def _notification_title(data: dict) -> str:
     if isinstance(title, str) and title.strip():
         return title.strip()
     return _project_name(data.get("cwd", ""))
+
+
+def _elapsed_label(started_at: object) -> str:
+    """"12s" / "7m" / "2h05m" since a background task started."""
+    if not isinstance(started_at, (int, float)) or started_at <= 0:
+        return ""
+    seconds = max(0, int(time.time() - started_at))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    hours, rest = divmod(seconds, 3600)
+    return f"{hours}h{rest // 60:02d}m"
 
 
 def _one_line(value: object) -> str:
