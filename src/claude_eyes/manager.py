@@ -141,6 +141,50 @@ def _session_launch_cwd(session_id: str) -> str:
     return ""
 
 
+_FORK_PARENT_CACHE: dict[str, str] = {}
+
+
+def _fork_parent(session_id: str) -> str:
+    """The session this one was forked from, per the transcript's `forkedFrom`.
+
+    `--fork-session` — a resumed conversation that branches, and how Claude Code
+    relaunches a background job — gives the continuation its own session id
+    while agent transcripts keep landing under the id the job was created with.
+    Looking for subagents under the live id alone therefore finds nothing, and
+    the session's whole second-level light group silently disappears.
+    """
+    cached = _FORK_PARENT_CACHE.get(session_id)
+    if cached is not None:
+        return cached
+    transcript = _session_transcript(session_id)
+    if transcript is None:
+        return ""
+    items = list(_iter_json_lines(_read_head(transcript, SUBAGENT_HEAD_BYTES)))
+    for item in items:
+        forked = item.get("forkedFrom")
+        parent = forked.get("sessionId") if isinstance(forked, dict) else None
+        if isinstance(parent, str) and parent and parent != session_id:
+            _FORK_PARENT_CACHE[session_id] = parent
+            return parent
+    if items:
+        # Settled: the head parsed and carries no fork marker. Caching the
+        # negative keeps a 32 KB read off every poll for every plain session.
+        _FORK_PARENT_CACHE[session_id] = ""
+    return ""
+
+
+def _fork_chain(session_id: str, limit: int = 4) -> list[str]:
+    """The session, then the ones it was forked from — nearest ancestor first."""
+    chain = [session_id]
+    current = session_id
+    for _ in range(limit):
+        current = _fork_parent(current)
+        if not current or current in chain:
+            break
+        chain.append(current)
+    return chain
+
+
 def _live_project_cwd(session_id: str, event_cwd: str) -> str:
     """The directory to group a session under.
 
@@ -623,11 +667,17 @@ def _discover_subagents(
     if transcript is None:
         return []
     discovered: dict[str, dict] = {}
-    subagent_dir = transcript.with_suffix("") / "subagents"
-    for path in sorted(subagent_dir.glob("*.jsonl")) if subagent_dir.is_dir() else []:
-        summary = _subagent_transcript_summary(path, now)
-        if summary:
-            discovered[summary["agent_id"]] = summary
+    for ancestor in _fork_chain(session_id):
+        root = transcript if ancestor == session_id else _session_transcript(ancestor)
+        if root is None:
+            continue
+        subagent_dir = root.with_suffix("") / "subagents"
+        for path in sorted(subagent_dir.glob("*.jsonl")) if subagent_dir.is_dir() else []:
+            summary = _subagent_transcript_summary(path, now)
+            # The live session's own copy of an agent wins over an ancestor's.
+            if summary and summary["agent_id"] not in discovered:
+                discovered[summary["agent_id"]] = summary
+
 
     # Hook events carry precise waiting/error/stop states; overlay them when
     # available, while transcript discovery covers agents already running.

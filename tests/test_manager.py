@@ -88,6 +88,7 @@ def _make_session(tmp_path, monkeypatch, session_id, agents):
     manager._SUBAGENT_CACHE.clear()
     manager._BACKGROUND_STATE.clear()
     manager._SESSION_CWD_CACHE.clear()
+    manager._FORK_PARENT_CACHE.clear()
     return subagents
 
 
@@ -313,6 +314,7 @@ def _write_transcript(tmp_path, monkeypatch, session_id, lines):
     manager._SESSION_TRANSCRIPT_CACHE.clear()
     manager._BACKGROUND_STATE.clear()
     manager._SESSION_CWD_CACHE.clear()
+    manager._FORK_PARENT_CACHE.clear()
     return transcript
 
 
@@ -981,3 +983,37 @@ def test_scan_drops_a_superseded_parent_and_deletes_its_file(monkeypatch, tmp_pa
 
     assert "gone" in panel.removes
     assert not (status / "gone.json").exists()
+
+
+# ----------------------------------------------------------------------
+# forked sessions
+# ----------------------------------------------------------------------
+def test_a_forked_session_finds_the_subagents_of_the_id_it_forked_from(
+    monkeypatch, tmp_path
+):
+    """`--fork-session` renames the conversation; agent transcripts do not move."""
+    _make_session(tmp_path, monkeypatch, "sid-origin", [
+        ("agent01", {"description": "Inherited agent"},
+         [_user("go"), _assistant("tool_use")], 5),
+    ])
+    projects = tmp_path / "projects" / "-Users-x-proj"
+    (projects / "sid-fork.jsonl").write_text(json.dumps({
+        "type": "user", "timestamp": _now().isoformat(),
+        "sessionId": "sid-fork",
+        "cwd": "/Users/x/proj",
+        "forkedFrom": {"sessionId": "sid-origin", "messageUuid": "u-1"},
+        "message": {"content": [{"type": "text", "text": "carry on"}]},
+    }) + "\n")
+    manager._SESSION_TRANSCRIPT_CACHE.clear()
+    manager._FORK_PARENT_CACHE.clear()
+
+    assert manager._fork_chain("sid-fork") == ["sid-fork", "sid-origin"]
+    assert [s["agent_id"] for s in manager._discover_subagents("sid-fork", _now())] == [
+        "agent01"
+    ]
+
+
+def test_a_plain_session_reports_no_fork_parent(monkeypatch, tmp_path):
+    _write_transcript(tmp_path, monkeypatch, "sid-plain", [_user("hello")])
+
+    assert manager._fork_chain("sid-plain") == ["sid-plain"]
